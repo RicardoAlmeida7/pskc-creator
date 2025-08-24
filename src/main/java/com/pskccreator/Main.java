@@ -9,6 +9,8 @@ import javax.xml.transform.*;
 import javax.xml.transform.dom.DOMSource;
 import javax.xml.transform.stream.StreamResult;
 import org.w3c.dom.*;
+import org.apache.commons.codec.binary.Base32;
+
 import java.io.*;
 import java.nio.file.*;
 import java.security.SecureRandom;
@@ -19,51 +21,63 @@ public class Main {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
-            System.out.println("Usage: java -jar pskc-creator.jar <input.csv> [--encrypt]");
+            System.out.println("Usage: java -jar pskc-creator.jar <input_base32.csv>");
             return;
         }
 
-        String csvFile = args[0];
-        boolean encrypt = args.length > 1 && args[1].equalsIgnoreCase("--encrypt");
+        String base32File = args[0];
+        String hexCSV = base32File.replaceFirst("\\.[^.]+$", "_hex.csv");
 
-        String outputFile = getOutputFileName(csvFile, encrypt);
-        List<String[]> tokens = readCSV(csvFile);
+        // Step 1: Convert Base32 secrets to Hex CSV
+        convertBase32ToHexCSV(base32File, hexCSV);
+        System.out.println("Hex CSV generated: " + hexCSV);
 
-        byte[] preSharedKey = null;
-        String preSharedKeyHex = null;
+        // Step 2: Read tokens from Hex CSV
+        List<String[]> tokens = readCSV(hexCSV);
 
-        if (encrypt) {
-            // Generate a random 32-byte pre-shared key for encryption
-            preSharedKey = new byte[32];
-            new SecureRandom().nextBytes(preSharedKey);
-            preSharedKeyHex = bytesToHex(preSharedKey);
+        // Step 3: Generate normal PSKC (plain)
+        Document xmlDoc = buildPSKC(tokens, null, false);
+        String normalPSKC = hexCSV.replaceFirst("_hex\\.csv$", ".pskc");
+        writeXML(xmlDoc, normalPSKC);
+        System.out.println("PSKC file generated (plain): " + normalPSKC);
 
-            // Save the generated key to a separate file for distribution
-            Path keyFile = Paths.get("preshared_key.txt");
-            Files.write(keyFile, preSharedKeyHex.getBytes());
-            System.out.println("Generated pre-shared key saved to: preshared_key.txt");
-        }
+        // Step 4: Generate encrypted PSKC
+        byte[] preSharedKey = new byte[32];
+        new SecureRandom().nextBytes(preSharedKey);
+        Files.write(Paths.get("preshared_key.txt"), bytesToHex(preSharedKey).getBytes());
+        System.out.println("Generated pre-shared key saved to: preshared_key.txt");
 
-        Document xmlDoc = buildPSKC(tokens, preSharedKey, encrypt);
-        writeXML(xmlDoc, outputFile);
+        Document encryptedDoc = buildPSKC(tokens, preSharedKey, true);
+        String encryptedPSKC = hexCSV.replaceFirst("_hex\\.csv$", "_encrypted.pskc");
+        writeXML(encryptedDoc, encryptedPSKC);
+        System.out.println("PSKC file generated (encrypted): " + encryptedPSKC);
+    }
 
-        System.out.println("PSKC file generated: " + outputFile);
-        if (encrypt) {
-            System.out.println("Encryption enabled: using generated pre-shared key");
-        } else {
-            System.out.println("Encryption disabled: secrets will be stored in plain Base64");
+    // Converts Base32 secrets to Hex and saves CSV
+    private static void convertBase32ToHexCSV(String inputFile, String outputCSV) throws IOException {
+        Base32 base32 = new Base32();
+        List<String> lines = Files.readAllLines(Paths.get(inputFile));
+        try (BufferedWriter writer = Files.newBufferedWriter(Paths.get(outputCSV))) {
+            for (String line : lines) {
+                if (line.trim().isEmpty() || line.startsWith("Serial")) continue;
+                String[] parts = line.split(",");
+                String serial = parts[0];
+                String base32Secret = parts[1];
+                String hexSecret = bytesToHex(base32.decode(base32Secret));
+                parts[1] = hexSecret;
+                writer.write(String.join(",", parts));
+                writer.newLine();
+            }
         }
     }
 
+    // Generate output PSKC file name based on encryption flag
     private static String getOutputFileName(String csvFile, boolean encrypt) {
         String baseName = csvFile.replaceFirst("\\.[^.]+$", "");
-        if (encrypt) {
-            return baseName + "_encrypted.pskc";
-        } else {
-            return baseName + ".pskc";
-        }
+        return encrypt ? baseName + "_encrypted.pskc" : baseName + ".pskc";
     }
 
+    // Reads CSV into list of token arrays
     private static List<String[]> readCSV(String csvFile) throws IOException {
         List<String[]> tokens = new ArrayList<>();
         List<String> lines = Files.readAllLines(Paths.get(csvFile));
@@ -74,6 +88,7 @@ public class Main {
         return tokens;
     }
 
+    // Build PSKC XML document
     private static Document buildPSKC(List<String[]> tokens, byte[] preSharedKey, boolean encrypt) throws Exception {
         DocumentBuilderFactory docFactory = DocumentBuilderFactory.newInstance();
         DocumentBuilder docBuilder = docFactory.newDocumentBuilder();
@@ -86,7 +101,6 @@ public class Main {
         keyContainer.setAttribute("xmlns:xenc", "http://www.w3.org/2001/04/xmlenc#");
         doc.appendChild(keyContainer);
 
-        // Create EncryptionKey and MACMethod only if encryption is enabled
         byte[] macKeyBytes = null;
         if (encrypt) {
             // EncryptionKey element with KeyName
