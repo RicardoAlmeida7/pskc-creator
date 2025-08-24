@@ -21,11 +21,12 @@ public class Main {
 
     public static void main(String[] args) throws Exception {
         if (args.length == 0) {
-            System.out.println("Usage: java -jar pskc-creator.jar <input_base32.csv>");
+            System.out.println("Usage: java -jar pskc-creator.jar <input_base32.csv> [--encrypt]");
             return;
         }
 
         String base32File = args[0];
+        boolean encrypt = args.length > 1 && args[1].equalsIgnoreCase("--encrypt");
         String hexCSV = base32File.replaceFirst("\\.[^.]+$", "_hex.csv");
 
         // Step 1: Convert Base32 secrets to Hex CSV
@@ -41,16 +42,22 @@ public class Main {
         writeXML(xmlDoc, normalPSKC);
         System.out.println("PSKC file generated (plain): " + normalPSKC);
 
-        // Step 4: Generate encrypted PSKC
-        byte[] preSharedKey = new byte[32];
-        new SecureRandom().nextBytes(preSharedKey);
-        Files.write(Paths.get("preshared_key.txt"), bytesToHex(preSharedKey).getBytes());
-        System.out.println("Generated pre-shared key saved to: preshared_key.txt");
+        // Step 4: Generate encrypted PSKC only if flag is set
+        if (encrypt) {
+            byte[] preSharedKey = new byte[32];
+            new SecureRandom().nextBytes(preSharedKey);
 
-        Document encryptedDoc = buildPSKC(tokens, preSharedKey, true);
-        String encryptedPSKC = hexCSV.replaceFirst("_hex\\.csv$", "_encrypted.pskc");
-        writeXML(encryptedDoc, encryptedPSKC);
-        System.out.println("PSKC file generated (encrypted): " + encryptedPSKC);
+            // Save pre-shared key to separate file for distribution
+            Files.write(Paths.get("preshared_key.txt"), bytesToHex(preSharedKey).getBytes());
+            System.out.println("Generated pre-shared key saved to: preshared_key.txt");
+
+            Document encryptedDoc = buildPSKC(tokens, preSharedKey, true);
+            String encryptedPSKC = hexCSV.replaceFirst("_hex\\.csv$", "_encrypted.pskc");
+            writeXML(encryptedDoc, encryptedPSKC);
+            System.out.println("PSKC file generated (encrypted): " + encryptedPSKC);
+        } else {
+            System.out.println("Encryption disabled: only plain PSKC was generated");
+        }
     }
 
     // Converts Base32 secrets to Hex and saves CSV
@@ -71,13 +78,6 @@ public class Main {
         }
     }
 
-    // Generate output PSKC file name based on encryption flag
-    private static String getOutputFileName(String csvFile, boolean encrypt) {
-        String baseName = csvFile.replaceFirst("\\.[^.]+$", "");
-        return encrypt ? baseName + "_encrypted.pskc" : baseName + ".pskc";
-    }
-
-    // Reads CSV into list of token arrays
     private static List<String[]> readCSV(String csvFile) throws IOException {
         List<String[]> tokens = new ArrayList<>();
         List<String> lines = Files.readAllLines(Paths.get(csvFile));
@@ -88,7 +88,6 @@ public class Main {
         return tokens;
     }
 
-    // Build PSKC XML document
     private static Document buildPSKC(List<String[]> tokens, byte[] preSharedKey, boolean encrypt) throws Exception {
         DocumentBuilderFactory docFactory = DocumentBuilderFactory.newInstance();
         DocumentBuilder docBuilder = docFactory.newDocumentBuilder();
@@ -103,17 +102,15 @@ public class Main {
 
         byte[] macKeyBytes = null;
         if (encrypt) {
-            // EncryptionKey element with KeyName
             Element encryptionKey = doc.createElement("EncryptionKey");
             appendTextElement(encryptionKey, "ds:KeyName", "Pre-shared-key");
             keyContainer.appendChild(encryptionKey);
 
-            // MACMethod element
             Element macMethod = doc.createElement("MACMethod");
             macMethod.setAttribute("Algorithm", "http://www.w3.org/2000/09/xmldsig#hmac-sha1");
             Element macKey = doc.createElement("MACKey");
 
-            macKeyBytes = new byte[20]; // HMAC-SHA1 = 20 bytes
+            macKeyBytes = new byte[20];
             new SecureRandom().nextBytes(macKeyBytes);
 
             byte[] ivMac = new byte[16];
@@ -129,7 +126,6 @@ public class Main {
             keyContainer.appendChild(macMethod);
         }
 
-        // Process each token
         for (String[] token : tokens) {
             String serial = token[0];
             String hexSecret = token[1];
@@ -151,29 +147,24 @@ public class Main {
                 valueMac = hmacSha1(macKeyBytes, combinedSecret);
             }
 
-            // KeyPackage element
             Element keyPackage = doc.createElement("KeyPackage");
             keyContainer.appendChild(keyPackage);
 
-            // DeviceInfo
             Element deviceInfo = doc.createElement("DeviceInfo");
             keyPackage.appendChild(deviceInfo);
             appendTextElement(deviceInfo, "Manufacturer", "Datablink");
             appendTextElement(deviceInfo, "SerialNo", serial);
             appendTextElement(deviceInfo, "Model", "SSV2");
 
-            // CryptoModuleInfo
             Element cryptoModuleInfo = doc.createElement("CryptoModuleInfo");
             appendTextElement(cryptoModuleInfo, "Id", "CM_ID_001");
             keyPackage.appendChild(cryptoModuleInfo);
 
-            // Key element
             Element keyElem = doc.createElement("Key");
             keyElem.setAttribute("Id", serial);
             keyElem.setAttribute("Algorithm", "urn:ietf:params:xml:ns:keyprov:pskc:" + totpType.toLowerCase());
             keyPackage.appendChild(keyElem);
 
-            // AlgorithmParameters
             Element algoParams = doc.createElement("AlgorithmParameters");
             keyElem.appendChild(algoParams);
             Element responseFormat = doc.createElement("ResponseFormat");
@@ -183,11 +174,9 @@ public class Main {
 
             appendTextElement(keyElem, "Issuer", issuer);
 
-            // Data
             Element data = doc.createElement("Data");
             keyElem.appendChild(data);
 
-            // Secret
             Element secret = doc.createElement("Secret");
             data.appendChild(secret);
 
@@ -207,12 +196,10 @@ public class Main {
                 appendTextElement(secret, "PlainValue", Base64.getEncoder().encodeToString(secretBytes));
             }
 
-            // Counter
             Element counter = doc.createElement("Counter");
             appendTextElement(counter, "PlainValue", "0");
             data.appendChild(counter);
 
-            // TOTP
             Element totp = doc.createElement("TOTP");
             totp.setAttribute("Algorithm", "SHA1");
             totp.setAttribute("Length", length);
@@ -256,7 +243,7 @@ public class Main {
     }
 
     private static byte[] aesEncrypt(byte[] data, byte[] key, byte[] iv) throws Exception {
-        SecretKeySpec skeySpec = new SecretKeySpec(key, 0, 16, "AES"); // AES-128
+        SecretKeySpec skeySpec = new SecretKeySpec(key, 0, 16, "AES");
         IvParameterSpec ivSpec = new IvParameterSpec(iv);
         Cipher cipher = Cipher.getInstance("AES/CBC/PKCS5Padding");
         cipher.init(Cipher.ENCRYPT_MODE, skeySpec, ivSpec);
